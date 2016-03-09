@@ -67,6 +67,7 @@ import static com.facebook.presto.testing.TestingAccessControlManager.TestingPri
 import static com.facebook.presto.testing.TestingAccessControlManager.privilege;
 import static com.facebook.presto.tests.QueryAssertions.assertContains;
 import static com.facebook.presto.tests.QueryAssertions.assertEqualsIgnoreOrder;
+import static com.facebook.presto.tests.QueryAssertions.assertQuery;
 import static com.google.common.collect.Iterables.getOnlyElement;
 import static com.google.common.collect.Iterables.transform;
 import static io.airlift.tpch.TpchTable.ORDERS;
@@ -129,6 +130,13 @@ public abstract class AbstractTestQueries
         super(queryRunner);
     }
 
+    @Test(expectedExceptions = RuntimeException.class, expectedExceptionsMessageRegExp = "line 1:16: no viable alternative at input.*")
+    public void testParsingError()
+            throws Exception
+    {
+        computeActual("SELECT foo FROM");
+    }
+
     @Test
     public void selectNull()
             throws Exception
@@ -155,6 +163,17 @@ public abstract class AbstractTestQueries
 
         materializedResult = computeActual("SELECT u, v, w FROM ( SELECT if(rand() > 0.5, 0, 1) AS u, 4*4 as v, 'abc' as w ) WHERE v > 10");
         assertEquals(materializedResult.getRowCount(), 1);
+    }
+
+    @Test
+    public void testNonDeterministicProjection()
+    {
+        MaterializedResult materializedResult = computeActual("select r, r + 1 from (select rand(100) r from orders) limit 10");
+        assertEquals(materializedResult.getRowCount(), 10);
+        for (MaterializedRow materializedRow : materializedResult) {
+            assertEquals(materializedRow.getFieldCount(), 2);
+            assertEquals(((Number) materializedRow.getField(0)).longValue() + 1, materializedRow.getField(1));
+        }
     }
 
     @Test
@@ -1217,7 +1236,15 @@ public abstract class AbstractTestQueries
     public void testGroupBySum()
             throws Exception
     {
-        assertQuery("SELECT orderstatus, SUM(totalprice) FROM ORDERS GROUP BY orderstatus");
+        assertQuery("SELECT suppkey, SUM(quantity) FROM lineitem GROUP BY suppkey");
+    }
+
+    @Test
+    public void testGroupByEmptyGroupingSet()
+            throws Exception
+    {
+        assertQuery("SELECT SUM(quantity) FROM lineitem GROUP BY ()",
+                "SELECT SUM(quantity) FROM lineitem");
     }
 
     @Test
@@ -1228,53 +1255,162 @@ public abstract class AbstractTestQueries
     }
 
     @Test
-    public void testSingleEmptyGroupBy()
-            throws Exception
-    {
-        assertQuery(
-                "SELECT SUM(quantity) " +
-                        "FROM lineitem " +
-                        "GROUP BY ()",
-                "SELECT SUM(quantity) " +
-                        "FROM lineitem");
-    }
-
-    @Test
-    public void testSingleEmptyGroupingSet()
-            throws Exception
-    {
-        assertQuery(
-                "SELECT SUM(quantity) " +
-                        "FROM lineitem " +
-                        "GROUP BY GROUPING SETS (())",
-                "SELECT SUM(quantity) " +
-                        "FROM lineitem");
-    }
-
-    @Test
     public void testSingleGroupingSet()
             throws Exception
     {
         assertQuery(
-                "SELECT suppkey, SUM(quantity) " +
+                "SELECT linenumber, SUM(quantity) " +
                         "FROM lineitem " +
-                        "GROUP BY GROUPING SETS (suppkey) ",
-                "SELECT suppkey, SUM(quantity) " +
+                        "GROUP BY GROUPING SETS (linenumber)",
+                "SELECT linenumber, SUM(quantity) " +
                         "FROM lineitem " +
-                        "GROUP BY suppkey");
+                        "GROUP BY linenumber");
     }
 
     @Test
-    public void testSingleGroupingSetMultipleColumns()
+    public void testGroupingSets()
             throws Exception
     {
-        assertQuery(
-                "SELECT linenumber, suppkey, SUM(quantity) " +
-                        "FROM lineitem " +
-                        "GROUP BY GROUPING SETS ((linenumber, suppkey)) ",
-                "SELECT linenumber, suppkey, SUM(quantity) " +
-                        "FROM lineitem " +
-                        "GROUP BY linenumber, suppkey");
+        assertQuery("SELECT linenumber, suppkey, SUM(quantity) FROM lineitem GROUP BY GROUPING SETS ((linenumber, suppkey), (suppkey))",
+                "SELECT linenumber, suppkey, SUM(quantity) FROM lineitem GROUP BY linenumber, suppkey UNION " +
+                        "SELECT NULL, suppkey, SUM(quantity) FROM lineitem GROUP BY suppkey");
+    }
+
+    @Test
+    public void testGroupingSetsWithSingleDistinct()
+            throws Exception
+    {
+        assertQuery("SELECT linenumber, suppkey, SUM(DISTINCT quantity) FROM lineitem GROUP BY GROUPING SETS ((linenumber, suppkey), (suppkey))",
+                "SELECT linenumber, suppkey, SUM(DISTINCT quantity) FROM lineitem GROUP BY linenumber, suppkey UNION " +
+                        "SELECT NULL, suppkey, SUM(DISTINCT quantity) FROM lineitem GROUP BY suppkey");
+    }
+
+    @Test
+    public void testGroupingSetsWithMultipleDistinct()
+            throws Exception
+    {
+        assertQuery("SELECT linenumber, suppkey, SUM(DISTINCT quantity), COUNT(DISTINCT linestatus) FROM lineitem GROUP BY GROUPING SETS ((linenumber, suppkey), (suppkey))",
+                "SELECT linenumber, suppkey, SUM(DISTINCT quantity), COUNT(DISTINCT linestatus) FROM lineitem GROUP BY linenumber, suppkey UNION " +
+                        "SELECT NULL, suppkey, SUM(DISTINCT quantity), COUNT(DISTINCT linestatus) FROM lineitem GROUP BY suppkey");
+    }
+
+    @Test
+    public void testGroupingSetsGrandTotalSet()
+            throws Exception
+    {
+        assertQuery("SELECT linenumber, suppkey, SUM(quantity) FROM lineitem GROUP BY GROUPING SETS ((linenumber, suppkey), ())",
+                "SELECT linenumber, suppkey, SUM(quantity) FROM lineitem GROUP BY linenumber, suppkey UNION " +
+                        "SELECT NULL, NULL, SUM(quantity) FROM lineitem");
+    }
+
+    @Test
+    public void testGroupingSetsRepeatedSetsAll()
+            throws Exception
+    {
+        assertQuery("SELECT linenumber, suppkey, SUM(quantity) FROM lineitem GROUP BY GROUPING SETS ((), (linenumber, suppkey), (), (linenumber, suppkey))",
+                "SELECT linenumber, suppkey, SUM(quantity) FROM lineitem GROUP BY linenumber, suppkey UNION ALL " +
+                        "SELECT NULL, NULL, SUM(quantity) FROM lineitem UNION ALL " +
+                        "SELECT linenumber, suppkey, SUM(quantity) FROM lineitem GROUP BY linenumber, suppkey UNION ALL " +
+                        "SELECT NULL, NULL, SUM(quantity) FROM lineitem");
+    }
+
+    @Test
+    public void testGroupingSetsRepeatedSetsDistinct()
+            throws Exception
+    {
+        assertQuery("SELECT linenumber, suppkey, SUM(quantity) FROM lineitem GROUP BY DISTINCT GROUPING SETS ((), (linenumber, suppkey), (), (linenumber, suppkey))",
+                "SELECT linenumber, suppkey, SUM(quantity) FROM lineitem GROUP BY linenumber, suppkey UNION ALL " +
+                        "SELECT NULL, NULL, SUM(quantity) FROM lineitem");
+    }
+
+    @Test
+    public void testGroupingSetsGrandTotalSetFirst()
+            throws Exception
+    {
+        assertQuery("SELECT linenumber, suppkey, SUM(quantity) FROM lineitem GROUP BY GROUPING SETS ((), (linenumber), (linenumber, suppkey))",
+                "SELECT linenumber, suppkey, SUM(quantity) FROM lineitem GROUP BY linenumber, suppkey UNION ALL " +
+                        "SELECT linenumber, NULL, SUM(quantity) FROM lineitem GROUP BY linenumber UNION ALL " +
+                        "SELECT NULL, NULL, SUM(quantity) FROM lineitem");
+    }
+
+    @Test
+    public void testGroupingSetsOnlyGrandTotalSet()
+            throws Exception
+    {
+        assertQuery("SELECT SUM(quantity) FROM lineitem GROUP BY GROUPING SETS (())",
+                "SELECT SUM(quantity) FROM lineitem");
+    }
+
+    @Test
+    public void testGroupingSetsMultipleGrandTotalSets()
+            throws Exception
+    {
+        assertQuery("SELECT SUM(quantity) FROM lineitem GROUP BY GROUPING SETS ((), ())",
+                "SELECT SUM(quantity) FROM lineitem UNION ALL " +
+                        "SELECT SUM(quantity) FROM lineitem");
+    }
+
+    @Test
+    public void testGroupingSetMixedExpressionAndColumn()
+            throws Exception
+    {
+        assertQuery("SELECT suppkey, month(shipdate), SUM(quantity) FROM lineitem GROUP BY month(shipdate), ROLLUP(suppkey)",
+                "SELECT suppkey, month(shipdate), SUM(quantity) FROM lineitem GROUP BY month(shipdate), suppkey UNION ALL " +
+                        "SELECT NULL, month(shipdate), SUM(quantity) FROM lineitem GROUP BY month(shipdate)");
+    }
+
+    @Test
+    public void testGroupingSetMixedExpressionAndOrdinal()
+            throws Exception
+    {
+        assertQuery("SELECT suppkey, month(shipdate), SUM(quantity) FROM lineitem GROUP BY 2, ROLLUP(suppkey)",
+                "SELECT suppkey, month(shipdate), SUM(quantity) FROM lineitem GROUP BY month(shipdate), suppkey UNION ALL " +
+                        "SELECT NULL, month(shipdate), SUM(quantity) FROM lineitem GROUP BY month(shipdate)");
+    }
+
+    @Test
+    public void testRollup()
+            throws Exception
+    {
+        assertQuery("SELECT linenumber, suppkey, SUM(quantity) FROM lineitem GROUP BY ROLLUP (linenumber, suppkey)",
+                "SELECT linenumber, suppkey, SUM(quantity) FROM lineitem GROUP BY linenumber, suppkey UNION ALL " +
+                        "SELECT linenumber, NULL, SUM(quantity) FROM lineitem GROUP BY linenumber UNION ALL " +
+                        "SELECT NULL, NULL, SUM(quantity) FROM lineitem");
+    }
+
+    @Test
+    public void testCube()
+            throws Exception
+    {
+        assertQuery("SELECT linenumber, suppkey, SUM(quantity) FROM lineitem GROUP BY CUBE (linenumber, suppkey)",
+                "SELECT linenumber, suppkey, SUM(quantity) FROM lineitem GROUP BY linenumber, suppkey UNION ALL " +
+                        "SELECT linenumber, NULL, SUM(quantity) FROM lineitem GROUP BY linenumber UNION ALL " +
+                        "SELECT NULL, suppkey, SUM(quantity) FROM lineitem GROUP BY suppkey UNION ALL " +
+                        "SELECT NULL, NULL, SUM(quantity) FROM lineitem");
+    }
+
+    @Test
+    public void testGroupingCombinationsAll()
+            throws Exception
+    {
+        assertQuery("SELECT orderkey, partkey, suppkey, linenumber, SUM(quantity) FROM lineitem GROUP BY orderkey, partkey, ROLLUP (suppkey, linenumber), CUBE (linenumber)",
+                "SELECT orderkey, partkey, suppkey, linenumber, SUM(quantity) FROM lineitem GROUP BY orderkey, suppkey, linenumber UNION ALL " +
+                        "SELECT orderkey, partkey, suppkey, linenumber, SUM(quantity) FROM lineitem GROUP BY orderkey, partkey, suppkey, linenumber UNION ALL " +
+                        "SELECT orderkey, partkey, NULL, linenumber, SUM(quantity) FROM lineitem GROUP BY orderkey, partkey, linenumber UNION ALL " +
+                        "SELECT orderkey, partkey, suppkey, linenumber, SUM(quantity) FROM lineitem GROUP BY orderkey, partkey, suppkey, linenumber UNION ALL " +
+                        "SELECT orderkey, partkey, suppkey, NULL, SUM(quantity) FROM lineitem GROUP BY orderkey, partkey, suppkey UNION ALL " +
+                        "SELECT orderkey, partkey, NULL, NULL, SUM(quantity) FROM lineitem GROUP BY orderkey, partkey");
+    }
+
+    @Test
+    public void testGroupingCombinationsDistinct()
+            throws Exception
+    {
+        assertQuery("SELECT orderkey, partkey, suppkey, linenumber, SUM(quantity) FROM lineitem GROUP BY DISTINCT orderkey, partkey, ROLLUP (suppkey, linenumber), CUBE (linenumber)",
+                "SELECT orderkey, partkey, suppkey, linenumber, SUM(quantity) FROM lineitem GROUP BY orderkey, suppkey, linenumber UNION ALL " +
+                        "SELECT orderkey, partkey, NULL, linenumber, SUM(quantity) FROM lineitem GROUP BY orderkey, partkey, linenumber UNION ALL " +
+                        "SELECT orderkey, partkey, suppkey, NULL, SUM(quantity) FROM lineitem GROUP BY orderkey, partkey, suppkey UNION ALL " +
+                        "SELECT orderkey, partkey, NULL, NULL, SUM(quantity) FROM lineitem GROUP BY orderkey, partkey");
     }
 
     @Test
@@ -1539,6 +1675,18 @@ public abstract class AbstractTestQueries
     }
 
     @Test
+    public void testJoinWithInferredFalseJoinClause()
+            throws Exception
+    {
+        assertQuery("" +
+                "SELECT COUNT(*)\n" +
+                "FROM orders\n" +
+                "JOIN lineitem\n" +
+                "ON CAST(orders.orderkey AS VARCHAR) = CAST(lineitem.orderkey AS VARCHAR)\n" +
+                "WHERE orders.orderkey = 1 AND lineitem.orderkey = 2\n");
+    }
+
+    @Test
     public void testJoinUsing()
             throws Exception
     {
@@ -1636,11 +1784,25 @@ public abstract class AbstractTestQueries
     public void testNonEqualityJoin()
             throws Exception
     {
+        assertQuery("SELECT COUNT(*) FROM lineitem JOIN orders ON lineitem.orderkey = orders.orderkey AND lineitem.quantity + length(orders.comment) > 7");
+        assertQuery("SELECT COUNT(*) FROM lineitem JOIN orders ON lineitem.orderkey = orders.orderkey AND NOT lineitem.quantity > 2");
+        assertQuery("SELECT COUNT(*) FROM lineitem JOIN orders ON NOT NOT lineitem.orderkey = orders.orderkey AND NOT NOT lineitem.quantity > 2");
+        assertQuery("SELECT COUNT(*) FROM lineitem JOIN orders ON lineitem.orderkey = orders.orderkey AND NOT NOT NOT lineitem.quantity > 2");
         assertQuery("SELECT COUNT(*) FROM lineitem JOIN orders ON lineitem.orderkey = orders.orderkey AND lineitem.quantity > 2");
         assertQuery("SELECT COUNT(*) FROM lineitem JOIN orders ON lineitem.orderkey = orders.orderkey AND lineitem.quantity <= 2");
         assertQuery("SELECT COUNT(*) FROM lineitem JOIN orders ON lineitem.orderkey = orders.orderkey AND lineitem.quantity != 2");
         assertQuery("SELECT COUNT(*) FROM lineitem JOIN orders ON lineitem.orderkey = orders.orderkey AND lineitem.shipdate > orders.orderdate");
         assertQuery("SELECT COUNT(*) FROM lineitem JOIN orders ON lineitem.orderkey = orders.orderkey AND orders.orderdate < lineitem.shipdate");
+        assertQuery("SELECT COUNT(*) FROM lineitem JOIN orders ON lineitem.orderkey = orders.orderkey AND orders.comment LIKE '%forges%'");
+        assertQuery("SELECT COUNT(*) FROM lineitem JOIN orders ON lineitem.orderkey = orders.orderkey AND orders.comment LIKE lineitem.comment");
+        assertQuery("SELECT COUNT(*) FROM lineitem JOIN orders ON lineitem.orderkey = orders.orderkey AND lineitem.comment LIKE '%forges%'");
+        assertQuery("SELECT COUNT(*) FROM lineitem JOIN orders ON lineitem.orderkey = orders.orderkey AND lineitem.comment LIKE orders.comment");
+        assertQuery("SELECT COUNT(*) FROM lineitem JOIN orders ON lineitem.orderkey = orders.orderkey AND orders.comment NOT LIKE '%forges%'");
+        assertQuery("SELECT COUNT(*) FROM lineitem JOIN orders ON lineitem.orderkey = orders.orderkey AND orders.comment NOT LIKE lineitem.comment");
+        assertQuery("SELECT COUNT(*) FROM lineitem JOIN orders ON lineitem.orderkey = orders.orderkey AND NOT (orders.comment LIKE '%forges%')");
+        assertQuery("SELECT COUNT(*) FROM lineitem JOIN orders ON lineitem.orderkey = orders.orderkey AND NOT (orders.comment LIKE lineitem.comment)");
+        assertQuery("SELECT COUNT(*) FROM lineitem JOIN orders ON lineitem.orderkey = orders.orderkey AND lineitem.quantity + length(orders.comment) > 7");
+        assertQuery("SELECT COUNT(*) FROM lineitem JOIN orders ON lineitem.orderkey = orders.orderkey AND NULL");
     }
 
     @Test(expectedExceptions = RuntimeException.class, expectedExceptionsMessageRegExp = ".*Non-equi.*")
@@ -1698,6 +1860,55 @@ public abstract class AbstractTestQueries
                 "  WHERE custkey % 512 = 0\n" +
                 ") AS orders\n" +
                 "ON lineitem.orderkey = orders.orderkey");
+    }
+
+    @Test
+    public void testJoinWithMultipleInSubqueryClauses()
+            throws Exception
+    {
+        String queryPrefix = "SELECT * " +
+                "FROM " +
+                "    (VALUES 1,2,3) t(x) " +
+                "  JOIN " +
+                "    (VALUES 1,2,3) t2(y) " +
+                "  ON ";
+
+        assertQuery(
+                queryPrefix + "(x in (VALUES 1,2,3)) = (y in (VALUES 1,2,3)) AND (x in (VALUES 1,2)) = (y in (VALUES 1,2))",
+                "VALUES (1,1), (1,2), (2,2), (2,1), (3,3)");
+        assertQuery(
+                queryPrefix + "(x in (VALUES 1,2)) = (y in (VALUES 1,2)) AND (x in (VALUES 1)) = (y in (VALUES 3))",
+                "VALUES (2,2), (2,1)");
+        assertQuery(
+                queryPrefix + "(x in (VALUES 1,2)) = (y in (VALUES 1,2)) AND (x in (VALUES 1)) != (y in (VALUES 3))",
+                "VALUES (1,2), (1,1), (3,3)");
+    }
+
+    @Test
+    public void testJoinWithInSubqueryToBeExecutedAsPostJoinFilter()
+            throws Exception
+    {
+        assertQuery(
+                "SELECT * FROM (VALUES 1, 2, 3) t(x) JOIN (VALUES 1, 2, 3) t2(y) ON (x+y in (VALUES 4, 5))",
+                "VALUES (1,3), (2,2), (2,3), (3,1), (3,2)");
+        assertQuery(
+                "SELECT * FROM (VALUES 1, 2, 3) t(x) JOIN (VALUES 1, 2, 3) t2(y) ON (x+y in (VALUES 4, 5)) AND (x*y in (VALUES 4))",
+                "VALUES (2,2)");
+        assertQuery(
+                "SELECT * FROM (VALUES 1, 2, 3) t(x) JOIN (VALUES 1, 2, 3) t2(y) ON (x+y in (VALUES 4, 5)) = (x*y IN (VALUES 4,5))",
+                "VALUES (1,1), (1,2), (2,1), (2,2), (3,3)");
+        assertQuery(
+                "SELECT * FROM (VALUES 1,2,3) t(x) JOIN (VALUES 1, 2, 3) t2(y) ON " +
+                        "(x+y in (VALUES (4),(5))) " +
+                        "AND " +
+                        "(x in (VALUES 1)) != (y in (VALUES 3))",
+                "VALUES (2,3)");
+        assertQuery(
+                "SELECT * FROM (VALUES 1,2,3) t(x) JOIN (VALUES 1, 2, 3) t2(y) ON " +
+                        "(x+y in (VALUES (4),(5))) " +
+                        "AND " +
+                        "(x in (VALUES 1)) = (y in (VALUES 3))",
+                "VALUES (1,3), (2,2), (3,2), (3,1)");
     }
 
     @Test
@@ -3360,6 +3571,14 @@ public abstract class AbstractTestQueries
     }
 
     @Test
+    public void testTryInvalidCast()
+            throws Exception
+    {
+        assertQuery("SELECT TRY(CAST('a' AS BIGINT))",
+                "SELECT NULL");
+    }
+
+    @Test
     public void testConcatOperator()
             throws Exception
     {
@@ -3584,11 +3803,17 @@ public abstract class AbstractTestQueries
         assertQuery("SELECT x FROM (values DATE '1970-01-01', DATE '1970-01-03') t(x) WHERE x IN (DATE '1970-01-01')", "values DATE '1970-01-01'");
         assertQuery("SELECT x FROM (values TIMESTAMP '1970-01-01 00:01:00+00:00', TIMESTAMP '1970-01-01 08:01:00+08:00', TIMESTAMP '1970-01-01 00:01:00+08:00') t(x) WHERE x IN (TIMESTAMP '1970-01-01 00:01:00+00:00')", "values TIMESTAMP '1970-01-01 00:01:00+00:00', TIMESTAMP '1970-01-01 08:01:00+08:00'");
         assertQuery("SELECT COUNT(*) FROM (values 1) t(x) WHERE x IN (null, 0)", "SELECT 0");
+    }
 
-        String longValues =  range(0, 20_000).asLongStream()
+    @Test
+    public void testLargeIn()
+        throws Exception
+    {
+        String longValues =  range(0, 5000).asLongStream()
                 .mapToObj(Long::toString)
                 .collect(joining(", "));
         assertQuery("SELECT orderkey FROM orders WHERE orderkey IN (" + longValues + ")");
+        assertQuery("SELECT orderkey FROM orders WHERE orderkey NOT IN (" + longValues + ")");
 
         String arrayValues = range(0, 5000).asLongStream()
                 .mapToObj(i -> format("ARRAY[%s, %s, %s]", i, i + 1, i + 2))
@@ -3623,6 +3848,21 @@ public abstract class AbstractTestQueries
         assertQuery(
                 "SELECT * FROM (SELECT orderkey, orderkey FROM orders)",
                 "SELECT orderkey, orderkey FROM orders");
+    }
+
+    @Test
+    public void testDuplicateColumnsInWindowOrderByClause()
+            throws Exception
+    {
+        MaterializedResult actual = computeActual("SELECT a, row_number() OVER (ORDER BY a, a) FROM (VALUES 3, 2, 1) t(a)");
+
+        MaterializedResult expected = resultBuilder(getSession(), BIGINT, BIGINT)
+                .row(1, 1)
+                .row(2, 2)
+                .row(3, 3)
+                .build();
+
+        assertEqualsIgnoreOrder(actual, expected);
     }
 
     @Test
@@ -3895,28 +4135,6 @@ public abstract class AbstractTestQueries
     }
 
     @Test
-    public void testShowPartitions()
-            throws Exception
-    {
-        MaterializedResult result = computeActual("SHOW PARTITIONS FROM orders");
-        // table is not partitioned
-        // TODO: add a partitioned table for tests and test where/order/limit
-        assertEquals(result.getMaterializedRows().size(), 0);
-    }
-
-    @Test
-    public void testShowPartitionsLimitAll()
-            throws Exception
-    {
-        MaterializedResult result = computeActual("SHOW PARTITIONS FROM orders");
-        MaterializedResult resultWithLimitAll = computeActual("SHOW PARTITIONS FROM orders LIMIT ALL");
-
-        // table is not partitioned
-        // TODO: add a partitioned table for limit all
-        assertEquals(result.getMaterializedRows().size(), resultWithLimitAll.getMaterializedRows().size());
-    }
-
-    @Test
     public void testShowFunctions()
             throws Exception
     {
@@ -4004,6 +4222,26 @@ public abstract class AbstractTestQueries
         assertEquals(properties.get("test_long"), new MaterializedRow(1, "test_long", "424242", "42", "bigint", "test long property"));
         assertEquals(properties.get("connector.connector_string"), new MaterializedRow(1, "connector.connector_string", "bar string", "connector default", "varchar", "connector string property"));
         assertEquals(properties.get("connector.connector_long"), new MaterializedRow(1, "connector.connector_long", "11", "33", "bigint", "connector long property"));
+    }
+
+    @Test
+    public void testTry()
+            throws Exception
+    {
+        // divide by zero
+        assertQuery(
+                "SELECT linenumber, sum(TRY(100/(CAST (tax*10 AS BIGINT)))) FROM lineitem GROUP BY linenumber",
+                "SELECT linenumber, sum(100/(CAST (tax*10 AS BIGINT))) FROM lineitem WHERE CAST(tax*10 AS BIGINT) <> 0 GROUP BY linenumber");
+
+        // invalid cast
+        assertQuery(
+                "SELECT TRY(CAST(IF(round(totalprice) % 2 = 0, CAST(totalprice AS VARCHAR), '^&$' || CAST(totalprice AS VARCHAR)) AS DOUBLE)) FROM orders",
+                "SELECT CASE WHEN round(totalprice) % 2 = 0 THEN totalprice ELSE null END FROM orders");
+
+        // invalid function argument
+        assertQuery(
+                "SELECT COUNT(TRY(to_base(100, CAST(round(totalprice/100) AS BIGINT)))) FROM orders",
+                "SELECT SUM(CASE WHEN CAST(round(totalprice/100) AS BIGINT) BETWEEN 2 AND 36 THEN 1 ELSE 0 END) FROM orders");
     }
 
     @Test
@@ -4431,6 +4669,11 @@ public abstract class AbstractTestQueries
     public void testSemiJoin()
             throws Exception
     {
+        assertQuery("SELECT linenumber, min(orderkey) " +
+                "FROM lineitem " +
+                "GROUP BY linenumber " +
+                "HAVING min(orderkey) IN (SELECT orderkey FROM orders WHERE orderkey > 1)");
+
         // Throw in a bunch of IN subquery predicates
         assertQuery("" +
                 "SELECT *, o2.custkey\n" +
@@ -4555,6 +4798,49 @@ public abstract class AbstractTestQueries
     }
 
     @Test
+    public void testSemiJoinWithGroupBy()
+            throws Exception
+    {
+        // using the same subquery in query
+        assertQuery("SELECT linenumber, min(orderkey), 6 IN (SELECT orderkey FROM orders WHERE orderkey < 7)" +
+                "FROM lineitem " +
+                "GROUP BY linenumber");
+
+        assertQuery("SELECT linenumber, min(orderkey), 6 IN (SELECT orderkey FROM orders WHERE orderkey < 7)" +
+                "FROM lineitem " +
+                "GROUP BY linenumber, 6 IN (SELECT orderkey FROM orders WHERE orderkey < 7)");
+
+        assertQuery("SELECT linenumber, min(orderkey) " +
+                "FROM lineitem " +
+                "GROUP BY linenumber, 6 IN (SELECT orderkey FROM orders WHERE orderkey < 7)");
+
+        assertQuery("SELECT linenumber, min(orderkey) " +
+                "FROM lineitem " +
+                "GROUP BY linenumber " +
+                "HAVING 6 IN (SELECT orderkey FROM orders WHERE orderkey < 7)");
+
+        assertQuery("SELECT linenumber, min(orderkey), 6 IN (SELECT orderkey FROM orders WHERE orderkey < 7)" +
+                "FROM lineitem " +
+                "GROUP BY linenumber, 6 IN (SELECT orderkey FROM orders WHERE orderkey < 7)" +
+                "HAVING 6 IN (SELECT orderkey FROM orders WHERE orderkey < 7)");
+
+        // using different subqueries
+        assertQuery("SELECT linenumber, min(orderkey), 6 IN (SELECT max(orderkey) FROM orders WHERE orderkey < 7)" +
+                "FROM lineitem " +
+                "GROUP BY linenumber, 6 IN (SELECT sum(orderkey) FROM orders WHERE orderkey < 5)");
+
+        assertQuery("SELECT linenumber, min(orderkey) " +
+                "FROM lineitem " +
+                "GROUP BY linenumber, 6 IN (SELECT orderkey FROM orders WHERE orderkey < 7)" +
+                "HAVING 6 IN (SELECT orderkey FROM orders WHERE orderkey > 3)");
+
+        assertQuery("SELECT linenumber, min(orderkey), 6 IN (SELECT orderkey FROM orders WHERE orderkey < 7)" +
+                "FROM lineitem " +
+                "GROUP BY linenumber, 6 IN (SELECT orderkey FROM orders WHERE orderkey < 5)" +
+                "HAVING 6 IN (SELECT orderkey FROM orders WHERE orderkey > 3)");
+    }
+
+    @Test
     public void testScalarSubquery()
             throws Exception
     {
@@ -4607,17 +4893,63 @@ public abstract class AbstractTestQueries
                     "GROUP BY l.orderkey");
         }
 
+        // subqueries with ORDER BY
+        assertQuery("SELECT orderkey, totalprice FROM orders ORDER BY (SELECT 2)");
+
         // subquery returns multiple rows
         String multipleRowsErrorMsg = "Scalar sub-query has returned multiple rows";
         assertQueryFails("SELECT * FROM lineitem WHERE orderkey = (\n" +
                 "SELECT orderkey FROM orders ORDER BY totalprice)",
                 multipleRowsErrorMsg);
-        assertQueryFails("SELECT (VALUES (1), (2)) IN (1,2)",
+        assertQueryFails("SELECT orderkey, totalprice FROM orders ORDER BY (VALUES 1, 2)",
                 multipleRowsErrorMsg);
 
         // exposes a bug in optimize hash generation because EnforceSingleNode does not
         // support more than one column from the underlying query
         assertQuery("SELECT custkey, (SELECT DISTINCT custkey FROM orders ORDER BY custkey LIMIT 1) FROM orders");
+    }
+
+    @Test
+    public void testScalarSubqueryWithGroupBy()
+            throws Exception
+    {
+        // using the same subquery in query
+        assertQuery("SELECT linenumber, min(orderkey), (SELECT max(orderkey) FROM orders WHERE orderkey < 7)" +
+                "FROM lineitem " +
+                "GROUP BY linenumber");
+
+        assertQuery("SELECT linenumber, min(orderkey), (SELECT max(orderkey) FROM orders WHERE orderkey < 7)" +
+                "FROM lineitem " +
+                "GROUP BY linenumber, (SELECT max(orderkey) FROM orders WHERE orderkey < 7)");
+
+        assertQuery("SELECT linenumber, min(orderkey) " +
+                "FROM lineitem " +
+                "GROUP BY linenumber, (SELECT max(orderkey) FROM orders WHERE orderkey < 7)");
+
+        assertQuery("SELECT linenumber, min(orderkey) " +
+                "FROM lineitem " +
+                "GROUP BY linenumber " +
+                "HAVING min(orderkey) < (SELECT avg(orderkey) FROM orders WHERE orderkey < 7)");
+
+        assertQuery("SELECT linenumber, min(orderkey), (SELECT max(orderkey) FROM orders WHERE orderkey < 7)" +
+                "FROM lineitem " +
+                "GROUP BY linenumber, (SELECT max(orderkey) FROM orders WHERE orderkey < 7)" +
+                "HAVING min(orderkey) < (SELECT max(orderkey) FROM orders WHERE orderkey < 7)");
+
+        // using different subqueries
+        assertQuery("SELECT linenumber, min(orderkey), (SELECT max(orderkey) FROM orders WHERE orderkey < 7)" +
+                "FROM lineitem " +
+                "GROUP BY linenumber, (SELECT sum(orderkey) FROM orders WHERE orderkey < 7)");
+
+        assertQuery("SELECT linenumber, max(orderkey), (SELECT min(orderkey) FROM orders WHERE orderkey < 5)" +
+                "FROM lineitem " +
+                "GROUP BY linenumber " +
+                "HAVING sum(orderkey) > (SELECT min(orderkey) FROM orders WHERE orderkey < 7)");
+
+        assertQuery("SELECT linenumber, min(orderkey), (SELECT max(orderkey) FROM orders WHERE orderkey < 7)" +
+                "FROM lineitem " +
+                "GROUP BY linenumber, (SELECT count(orderkey) FROM orders WHERE orderkey < 7)" +
+                "HAVING min(orderkey) < (SELECT sum(orderkey) FROM orders WHERE orderkey < 7)");
     }
 
     @Test
